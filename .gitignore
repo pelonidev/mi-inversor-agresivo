@@ -1,0 +1,28 @@
+# Credenciales y secretos
+.env
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Datos y logs
+logs/
+*.log
+data/*.csv
+data/*.parquet
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Backtesting / notebooks
+.ipynb_checkpoints/
+*.ipynb

@@ -1,0 +1,9 @@
+# Dependencias MÍNIMAS del daemon en producción (radar 24/7).
+# El runtime NO necesita vectorbt/numba/statsmodels (solo se usan en el
+# research offline: backtest.py, screener.py, walk_forward.py). Esto mantiene
+# la imagen ultraligera y el build rápido.
+ccxt>=4.3.0
+aiohttp>=3.9.0
+rich>=13.7.0
+python-dotenv>=1.0.0
+structlog>=24.1.0

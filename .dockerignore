@@ -1,0 +1,38 @@
+# Nunca hornear secretos ni datos en la imagen.
+.env
+.env.*
+!.env.example
+
+# Git / IDE
+.git
+.gitignore
+.vscode/
+.idea/
+
+# Entornos y caché de Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Datos, resultados y logs (no van en la imagen)
+data/
+*.parquet
+*.csv
+*.html
+*.log
+logs/
+
+# Research offline (no lo necesita el daemon en producción)
+backtest.py
+screener.py
+walk_forward.py
+funding_research.py
+test_margin_mock.py
+main.py
+
+# Notebooks
+*.ipynb
+.ipynb_checkpoints/
