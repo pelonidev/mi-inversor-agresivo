@@ -26,5 +26,5 @@ COPY --chown=radar:radar daemon.py funding_radar.py liquidity_gate.py execution.
 
 USER radar
 
-# Vigilante: escanea el top-100 de perps cada 5 minutos.
-CMD ["python", "daemon.py", "--interval", "300", "--top", "100"]
+# Vigilante: cadencia fija de escaneo definida por SCAN_INTERVAL_SECONDS (30s).
+CMD ["python", "daemon.py"]

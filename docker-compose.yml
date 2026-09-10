@@ -5,7 +5,7 @@
 services:
   funding-radar:
     build: .
-    container_name: funding-radar
+    container_name: agresivo-radar
     # Carga API keys, tokens de Telegram y AUTO_TRADE desde el .env del host.
     env_file:
       - .env
@@ -21,8 +21,8 @@ services:
       options:
         max-size: "10m"   # cada archivo de log, máx 10 MB
         max-file: "5"     # conserva 5 -> 50 MB de logs como máximo
-    # Sobrescribe el intervalo/universo sin reconstruir la imagen si hace falta.
-    # command: ["python", "daemon.py", "--interval", "300", "--top", "100"]
+    # Sobrescribe el exchange sin reconstruir la imagen si hace falta.
+    # command: ["python", "daemon.py", "--exchange", "binance"]
     stop_grace_period: 20s
 
 volumes:

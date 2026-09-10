@@ -22,7 +22,9 @@ from pathlib import Path
 from typing import Any
 
 # Parámetros del paper trading.
-PAPER_INITIAL_CAPITAL = 100.0     # USDT virtuales
+INITIAL_PAPER_CAPITAL = 1500.0    # USDT virtuales (banco base)
+PAPER_INITIAL_CAPITAL = INITIAL_PAPER_CAPITAL  # alias retrocompatible
+LEGACY_CAPITAL_TO_MIGRATE = 100.0  # banco antiguo a parchear al nuevo base
 PAPER_FEE_PER_LEG = 0.001         # 0.1% taker por pata (market orders)
 PAPER_N_LEGS = 4                  # spot+perp en entrada y en salida
 FUNDING_INTERVAL_S = 8 * 60 * 60  # el funding se liquida cada 8h
@@ -78,6 +80,12 @@ class PerformanceTracker:
         self._start_date = data.get("start_date", self._start_date)
         raw_open = data.get("open_trade")
         self._open = PaperTrade(**raw_open) if raw_open else None
+
+        # Parche de banco: migra el capital base antiguo (100) al nuevo (1500)
+        # conservando el historial. current_capital = 1500 + net_pnl acumulado.
+        if self._initial_capital == LEGACY_CAPITAL_TO_MIGRATE:
+            self._initial_capital = INITIAL_PAPER_CAPITAL
+            self.save()
 
     def save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,6 +185,84 @@ class PerformanceTracker:
         self.save()
         return record
 
+    def record_pairs_trade(
+        self,
+        pair: str,
+        direction: str,
+        entry_z: float,
+        exit_z: float,
+        gross_pnl: float,
+        fees: float,
+        entry_ts: float,
+        notional: float,
+        max_z: float | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Consolida un trade de Pairs Trading (Z-Score) ya cerrado.
+
+        A diferencia del funding arbitrage, aquí el PnL proviene de la
+        convergencia del ratio (no del funding), así que se pasa ya calculado.
+        Aditivo y compatible con stats()/format_status()/format_trades().
+        """
+        net_pnl = gross_pnl - fees
+        record = {
+            "ticker": pair,
+            "direction": direction,
+            "entry_date": datetime.fromtimestamp(entry_ts, timezone.utc).isoformat(),
+            "exit_date": datetime.now(timezone.utc).isoformat(),
+            "entry_z": round(entry_z, 4),
+            "exit_z": round(exit_z, 4),
+            "max_z": round(max_z, 4) if max_z is not None else None,
+            "reason": reason,
+            "success": net_pnl > 0,
+            "gross_pnl": round(gross_pnl, 6),
+            "fees": round(fees, 6),
+            "net_pnl": round(net_pnl, 6),
+            "notional": notional,
+        }
+        self._trades.append(record)
+        self._realized_pnl += net_pnl
+        self.save()
+        return record
+
+    # ------------------------------------------------------------------ #
+    #  Analítica de pares (al vuelo)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _clean_pair(ticker: str) -> str:
+        """Normaliza el nombre del par quitando la cotización (SOL/USDT/XRP/USDT -> SOL/XRP)."""
+        bases = [p for p in ticker.split("/") if p.upper() not in ("USDT", "USD", "BUSD")]
+        return "/".join(bases) if bases else ticker
+
+    def _pairs_summary(self) -> dict[str, dict[str, Any]]:
+        """Agrupa los trades de pares cerrados por par: PnL, wins, losses, total."""
+        groups: dict[str, dict[str, Any]] = {}
+        for t in self._trades:
+            if "direction" not in t:      # ignora el historial antiguo (funding)
+                continue
+            name = self._clean_pair(t.get("ticker", "?"))
+            g = groups.setdefault(
+                name, {"pnl": 0.0, "wins": 0, "losses": 0, "trades": 0, "notional": 0.0}
+            )
+            pnl = t.get("net_pnl", 0.0)
+            g["pnl"] += pnl
+            g["notional"] += t.get("notional", 0.0)
+            g["trades"] += 1
+            if pnl > 0:
+                g["wins"] += 1
+            else:
+                g["losses"] += 1
+        return groups
+
+    def _avg_max_z_wins(self) -> float:
+        """Media del Z-Score máximo alcanzado en los trades ganadores (con max_z)."""
+        zs = [
+            t["max_z"]
+            for t in self._trades
+            if "direction" in t and t.get("net_pnl", 0.0) > 0 and t.get("max_z") is not None
+        ]
+        return sum(zs) / len(zs) if zs else 0.0
+
     # ------------------------------------------------------------------ #
     #  Métricas
     # ------------------------------------------------------------------ #
@@ -213,19 +299,36 @@ class PerformanceTracker:
         }
 
     def format_status(self) -> str:
-        """Mensaje limpio para el comando /pnl de Telegram."""
+        """Mensaje limpio para el comando /status y /pnl de Telegram."""
         s = self.stats()
-        pos = s["active_position"] or "Ninguna"
-        return (
-            "📊 <b>ESTADO DEL RADAR (PAPER TRADING)</b>\n"
-            f"• Capital Actual: {s['current_capital']:.2f} USDT "
-            f"({s['total_return_pct']:+.2f}%)\n"
-            f"• Beneficio Acumulado: {s['accumulated_pnl']:+.2f} USDT\n"
-            f"• Media Diaria: {s['daily_avg_pct']:+.3f}% / día\n"
-            f"• Trades Realizados: {s['n_trades']} (Win Rate: {s['win_rate']:.0f}%)\n"
-            f"🛡️ Trampas de Liquidez Evitadas: {s['total_traps_avoided']}\n"
-            f"• Posición Activa: {pos}"
-        )
+        lines = [
+            "📊 <b>ESTADO MIA (PAIRS TRADING)</b>",
+            f"• Capital Actual: {s['current_capital']:.2f} USDT ({s['total_return_pct']:+.2f}%)",
+            f"• Beneficio Acumulado: {s['accumulated_pnl']:+.2f} USDT",
+            f"• Media Diaria: {s['daily_avg_pct']:+.3f}% / día",
+            f"• Trades Realizados: {s['n_trades']} (Win Rate: {s['win_rate']:.0f}%)",
+            f"📈 Z-Score Máx. Medio (ganancias): {self._avg_max_z_wins():.2f}",
+        ]
+
+        groups = self._pairs_summary()
+        if groups:
+            ranked = sorted(groups.items(), key=lambda kv: kv[1]["pnl"], reverse=True)
+            lines.append("🏆 <b>TOP 3 PARES</b>")
+            for i, (name, g) in enumerate(ranked[:3], start=1):
+                # Rentabilidad aislada: PnL sobre el nocional asignado a ese par.
+                pct = g["pnl"] / g["notional"] * 100 if g["notional"] else 0.0
+                lines.append(
+                    f"{i}. {name} | {g['wins']}/{g['trades']} wins | "
+                    f"{g['pnl']:+.2f} USDT ({pct:+.1f}%)"
+                )
+            rest = ranked[3:]
+            if rest:
+                lines.append("📋 <b>RESTO DE PARES</b>")
+                for name, g in rest:
+                    lines.append(
+                        f"• {name} | {g['wins']}W/{g['losses']}L | {g['pnl']:+.2f} USDT"
+                    )
+        return "\n".join(lines)
 
     def format_trades(self, limit: int = 5) -> str:
         """Lista los últimos `limit` trades cerrados para el comando /trades."""

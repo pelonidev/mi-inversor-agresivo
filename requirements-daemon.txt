@@ -7,3 +7,6 @@ aiohttp>=3.9.0
 rich>=13.7.0
 python-dotenv>=1.0.0
 structlog>=24.1.0
+# Estrategia Pairs Trading (Z-Score): matemática vectorizada del daemon.
+numpy>=1.26.0
+pandas>=2.2.0

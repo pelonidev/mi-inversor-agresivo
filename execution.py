@@ -7,6 +7,9 @@ Contiene los dos módulos finales para operar Funding Rate Arbitrage delta-neutr
       Como el Liquidity Gate ya validó el slippage, usa Market Orders para
       garantizar el fill de ambas patas y la neutralidad delta.
 
+    • DualPerpExecutionEngine: variante Pairs Trading (perp vs perp). Divide el
+      nocional 50/50 y lanza una pata LONG y otra SHORT en Futuros (Market).
+
     • MarginManager: tarea de fondo que vigila el Margin Ratio del perpetuo corto.
       Si el subyacente sube y el uso de margen se acerca a la liquidación, mueve
       USDT del wallet SPOT al de FUTUROS (ccxt.transfer) para alejar el precio de
@@ -241,6 +244,206 @@ class DualMarketExecutionEngine:
     def _normalize(self, exchange: ccxt_async.Exchange, symbol: str, amount: float) -> float:
         try:
             return float(exchange.amount_to_precision(symbol, amount))
+        except (ccxt.BadSymbol, KeyError, ValueError):
+            return float(amount)
+
+    @staticmethod
+    def _fill_price(result: Any, fallback: float) -> float:
+        if isinstance(result, dict):
+            return float(result.get("average") or result.get("price") or fallback)
+        return fallback
+
+
+# --------------------------------------------------------------------------- #
+#  DualPerpExecutionEngine — Pairs Trading (perp vs perp, delta-neutral)
+# --------------------------------------------------------------------------- #
+@dataclass(slots=True)
+class PairFill:
+    """Resultado de abrir un par delta-neutral en el mercado de Futuros."""
+
+    sym_a: str
+    sym_b: str
+    direction: str        # "SHORT_A_LONG_B" | "LONG_A_SHORT_B"
+    qty_a: float
+    qty_b: float
+    price_a: float
+    price_b: float
+
+
+class DualPerpExecutionEngine:
+    """Ejecuta pares delta-neutral (perp vs perp) con Market Orders en Futuros.
+
+    Ambas patas viven en el mercado USDT-M (`defaultType='future'`): una de
+    COMPRA (long) y otra de VENTA (short). El capital nocional se divide en dos
+    mitades exactas (50% long / 50% short) y la cantidad de tokens de cada pata
+    se calcula al precio actual. Reutiliza el patrón de reintentos/backoff y el
+    unwind de pata parcial para no dejar nunca delta abierto.
+    """
+
+    def __init__(
+        self,
+        exchange: ccxt_async.Exchange,
+        risk_manager: RiskManager,
+        config: ExecutionConfig | None = None,
+    ) -> None:
+        self._ex = exchange
+        self._risk = risk_manager
+        self._cfg = config or ExecutionConfig()
+
+    async def open_pair(
+        self, sym_a: str, sym_b: str, direction: str, notional_usd: float
+    ) -> PairFill | None:
+        """Abre el par lanzando ambas patas Market simultáneamente."""
+        if self._risk.is_halted:
+            log.warning("apertura_par_bloqueada_killswitch")
+            return None
+
+        side_a, side_b = self._sides(direction)
+        leg_notional = notional_usd / 2.0   # 50% / 50% exacto por pata
+
+        price_a, price_b = await asyncio.gather(
+            self._ref_price(sym_a), self._ref_price(sym_b)
+        )
+        if price_a <= 0 or price_b <= 0:
+            log.warning("precio_invalido_par", a=price_a, b=price_b)
+            return None
+
+        qty_a = self._normalize(sym_a, leg_notional / price_a)
+        qty_b = self._normalize(sym_b, leg_notional / price_b)
+        if qty_a <= 0 or qty_b <= 0:
+            log.warning("cantidad_invalida_par", qa=qty_a, qb=qty_b)
+            return None
+
+        log.info("abriendo_par", a=sym_a, b=sym_b, direction=direction, qa=qty_a, qb=qty_b)
+        res_a, res_b = await asyncio.gather(
+            self._safe_market_order(sym_a, side_a, qty_a),
+            self._safe_market_order(sym_b, side_b, qty_b),
+            return_exceptions=True,
+        )
+        ok_a = not isinstance(res_a, BaseException)
+        ok_b = not isinstance(res_b, BaseException)
+
+        if ok_a and ok_b:
+            fill = PairFill(
+                sym_a=sym_a,
+                sym_b=sym_b,
+                direction=direction,
+                qty_a=qty_a,
+                qty_b=qty_b,
+                price_a=self._fill_price(res_a, price_a),
+                price_b=self._fill_price(res_b, price_b),
+            )
+            log.info("par_abierto", a=sym_a, b=sym_b, direction=direction)
+            return fill
+
+        await self._unwind_partial(
+            sym_a, sym_b, side_a, side_b, qty_a, qty_b, ok_a, ok_b, res_a, res_b
+        )
+        return None
+
+    async def close_pair(
+        self, sym_a: str, sym_b: str, direction: str, qty_a: float, qty_b: float
+    ) -> bool:
+        """Cierra el par lanzando el lado opuesto de cada pata simultáneamente."""
+        side_a, side_b = self._sides(direction)
+        close_a = self._opposite(side_a)
+        close_b = self._opposite(side_b)
+
+        log.info("cerrando_par", a=sym_a, b=sym_b)
+        res_a, res_b = await asyncio.gather(
+            self._safe_market_order(sym_a, close_a, qty_a),
+            self._safe_market_order(sym_b, close_b, qty_b),
+            return_exceptions=True,
+        )
+        ok = not isinstance(res_a, BaseException) and not isinstance(res_b, BaseException)
+        if ok:
+            log.info("par_cerrado", a=sym_a, b=sym_b)
+        else:
+            log.critical("cierre_par_parcial_EXPOSICION", a=sym_a, b=sym_b)
+            self._risk.trip_kill_switch(reason="pair_close_failed")
+        return ok
+
+    # ------------------------------------------------------------------ #
+    #  Utilidades
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _sides(direction: str) -> tuple[Side, Side]:
+        # SHORT_A_LONG_B -> vender A, comprar B ; LONG_A_SHORT_B -> comprar A, vender B
+        if direction == "SHORT_A_LONG_B":
+            return Side.SELL, Side.BUY
+        return Side.BUY, Side.SELL
+
+    @staticmethod
+    def _opposite(side: Side) -> Side:
+        return Side.BUY if side is Side.SELL else Side.SELL
+
+    async def _unwind_partial(
+        self,
+        sym_a: str,
+        sym_b: str,
+        side_a: Side,
+        side_b: Side,
+        qty_a: float,
+        qty_b: float,
+        ok_a: bool,
+        ok_b: bool,
+        res_a: Any,
+        res_b: Any,
+    ) -> None:
+        """Deshace la pata que sí entró si la otra falló (evita delta abierto)."""
+        if not ok_a and not ok_b:
+            log.error("ambas_patas_par_fallaron", a=str(res_a), b=str(res_b))
+            return
+        try:
+            if ok_a and not ok_b:
+                log.error("leg_risk_b_fallo_deshaciendo_a", error=str(res_b))
+                await self._safe_market_order(sym_a, self._opposite(side_a), qty_a)
+            elif ok_b and not ok_a:
+                log.error("leg_risk_a_fallo_deshaciendo_b", error=str(res_a))
+                await self._safe_market_order(sym_b, self._opposite(side_b), qty_b)
+        except Exception as exc:  # noqa: BLE001 - último recurso
+            log.critical("fallo_deshacer_par_EXPOSICION", error=str(exc))
+            self._risk.trip_kill_switch(reason="pair_unwind_failed")
+
+    async def _safe_market_order(
+        self, symbol: str, side: Side, amount: float
+    ) -> dict[str, Any]:
+        backoff = self._cfg.base_backoff_s
+        last_exc: Exception | None = None
+        for attempt in range(1, self._cfg.max_retries + 1):
+            try:
+                return await asyncio.wait_for(
+                    self._ex.create_order(symbol, "market", side.value, amount),
+                    timeout=self._cfg.order_timeout_s,
+                )
+            except ccxt.InsufficientFunds as exc:
+                log.error("fondos_insuficientes_par", symbol=symbol, error=str(exc))
+                raise
+            except (_RETRYABLE, asyncio.TimeoutError) as exc:
+                last_exc = exc
+                log.warning("orden_par_reintento", symbol=symbol, intento=attempt,
+                            error=type(exc).__name__, backoff_s=round(backoff, 2))
+                if attempt < self._cfg.max_retries:
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, self._cfg.max_backoff_s)
+            except ccxt.ExchangeError as exc:
+                log.error("error_exchange_orden_par", symbol=symbol, error=str(exc))
+                raise
+        raise RuntimeError(
+            f"orden par fallida {symbol} tras {self._cfg.max_retries} intentos: {last_exc}"
+        )
+
+    async def _ref_price(self, symbol: str) -> float:
+        try:
+            ticker = await self._ex.fetch_ticker(symbol)
+            return float(ticker.get("last") or ticker.get("close") or 0.0)
+        except ccxt.BaseError as exc:
+            log.error("fallo_ref_price_par", symbol=symbol, error=str(exc))
+            return 0.0
+
+    def _normalize(self, symbol: str, amount: float) -> float:
+        try:
+            return float(self._ex.amount_to_precision(symbol, amount))
         except (ccxt.BadSymbol, KeyError, ValueError):
             return float(amount)
 
