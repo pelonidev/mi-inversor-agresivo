@@ -100,6 +100,8 @@ class PairPosition:
     entry_ts: float
     max_z: float = 0.0    # |Z| máximo alcanzado durante la vida del trade
     current_z: float = 0.0  # Z-Score actual del par contra el mercado
+    current_pnl: float = 0.0  # PnL latente estimado (mark-to-market) en USDT
+    force_close: bool = False  # kill switch manual vía /close
 
     def __post_init__(self) -> None:
         # Compat JSON antiguo: si no traía max_z, lo sembramos con |entry_z|.
@@ -329,8 +331,30 @@ class Daemon:
             if pos.sym_a not in prices.columns or pos.sym_b not in prices.columns:
                 log.warning("exit_sin_datos", pair=pos.key)
                 continue
+            price_a = float(prices[pos.sym_a].iloc[-1])
+            price_b = float(prices[pos.sym_b].iloc[-1])
+
+            # Mark-to-Market: PnL latente = retorno de cada pata * su notional,
+            # menos las comisiones de un ciclo completo (entrada + salida).
+            if pos.direction == "SHORT_A_LONG_B":
+                ret_a = (pos.entry_price_a - price_a) / pos.entry_price_a   # short A
+                ret_b = (price_b - pos.entry_price_b) / pos.entry_price_b   # long B
+            else:  # LONG_A_SHORT_B
+                ret_a = (price_a - pos.entry_price_a) / pos.entry_price_a   # long A
+                ret_b = (pos.entry_price_b - price_b) / pos.entry_price_b   # short B
+            fees = pos.leg_notional * FEES_PER_TRADE
+            pos.current_pnl = ret_a * pos.leg_notional + ret_b * pos.leg_notional - fees
+
             z = compute_zscore(prices[pos.sym_a], prices[pos.sym_b])
+
+            # Cierre manual prioritario (kill switch): antes que TP/SL/temporal.
+            if pos.force_close:
+                exit_z = z if not np.isnan(z) else pos.current_z
+                await self._close_position(session, pos, price_a, price_b, exit_z, "Cierre Manual")
+                continue
+
             if np.isnan(z):
+                self._save_positions()
                 continue
 
             # Tracking del Z-Score máximo alcanzado (se persiste en el JSON).
@@ -351,8 +375,6 @@ class Daemon:
             log.info("vigilando_par", pair=pos.key, z=round(z, 2),
                      max_z=round(pos.max_z, 2), held_h=round(held_h, 1))
             if reason is not None:
-                price_a = float(prices[pos.sym_a].iloc[-1])
-                price_b = float(prices[pos.sym_b].iloc[-1])
                 await self._close_position(session, pos, price_a, price_b, z, reason)
 
     async def _close_position(
@@ -551,7 +573,8 @@ class Daemon:
                     data = await resp.json()
                 for upd in data.get("result", []):
                     offset = upd["update_id"] + 1
-                    text = ((upd.get("message") or {}).get("text") or "").strip().lower()
+                    raw = ((upd.get("message") or {}).get("text") or "").strip()
+                    text = raw.lower()
                     if text.startswith("/pnl") or text.startswith("/status"):
                         msg = (
                             f"{self._tracker.format_status()}\n"
@@ -563,11 +586,55 @@ class Daemon:
                     elif text.startswith("/trades"):
                         await send_telegram(session, self._tracker.format_trades(5))
                         log.info("comando_telegram", cmd=text)
+                    elif text.startswith("/close"):
+                        await self._handle_close_command(session, raw.split()[1:])
+                        log.info("comando_telegram", cmd=text)
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 await asyncio.sleep(5)
             except Exception as exc:  # noqa: BLE001 - el listener nunca debe morir
                 log.error("telegram_listener_error", error=str(exc))
                 await asyncio.sleep(5)
+
+    async def _handle_close_command(self, session: aiohttp.ClientSession, args: list[str]) -> None:
+        """Kill switch dirigido: /close N (número de /status) o /close TOKEN1/TOKEN2."""
+        if not args:
+            await send_telegram(
+                session,
+                "⚠️ Debes especificar el par. Uso: /close N (número de /status) "
+                "o /close TOKEN1/TOKEN2",
+            )
+            return
+        arg = args[0].strip()
+        positions = list(self._positions.values())
+        target: PairPosition | None = None
+
+        if arg.isdigit():
+            # Selección por número (1-based) según el orden mostrado en /status.
+            idx = int(arg)
+            if 1 <= idx <= len(positions):
+                target = positions[idx - 1]
+        else:
+            pair_arg = arg.upper()
+            for pos in positions:
+                base_a, base_b = pos.bases
+                if f"{base_a}/{base_b}" == pair_arg or pos.key == pair_arg:
+                    target = pos
+                    break
+
+        if target is None:
+            await send_telegram(
+                session, "❌ No hay ninguna posición abierta para ese número/par."
+            )
+            return
+        target.force_close = True
+        self._save_positions()
+        base_a, base_b = target.bases
+        await send_telegram(
+            session,
+            f"⚠️ Comando recibido. Cerrando posición de {base_a}/{base_b} "
+            f"en el próximo ciclo (max 30s)...",
+        )
+        log.warning("cierre_manual_solicitado", pair=target.key)
 
     def _format_uptime(self) -> str:
         """Tiempo que lleva viva esta sesión del bot (Nd Nh Nm)."""
@@ -587,13 +654,15 @@ class Daemon:
         if not self._positions:
             return "📂 <b>PARES ABIERTOS</b>\nNinguno."
         lines = [f"📂 <b>PARES ABIERTOS ({len(self._positions)})</b>"]
-        for pos in self._positions.values():
+        for idx, pos in enumerate(self._positions.values(), start=1):
             base_a, base_b = pos.bases
             side = "SHORT/LONG" if pos.direction == "SHORT_A_LONG_B" else "LONG/SHORT"
             lines.append(
-                f"• {base_a}/{base_b} | {side} | "
-                f"Z ent: {pos.entry_z:+.2f} | Z act: {pos.current_z:+.2f}"
+                f"<b>{idx})</b> {base_a}/{base_b} | {side} | "
+                f"Z ent: {pos.entry_z:+.2f} | Z act: {pos.current_z:+.2f} | "
+                f"PnL Est: {pos.current_pnl:+.2f} USDT"
             )
+        lines.append("\n✏️ Cierre manual: <code>/close N</code> (número del par)")
         return "\n".join(lines)
 
     async def _maybe_heartbeat(self, session: aiohttp.ClientSession) -> None:
